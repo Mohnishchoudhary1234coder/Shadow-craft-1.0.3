@@ -1,0 +1,483 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<title>noa single-file demo — resilient CDN loader</title>
+<style>
+  html,body{height:100%;margin:0;background:#0b1220;overflow:hidden;font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial}
+  #game{width:100%;height:100%;display:block}
+  #hud{position:fixed;left:12px;top:12px;z-index:60;background:rgba(0,0,0,0.45);color:#fff;padding:8px 12px;border-radius:8px;font-family:monospace;font-size:13px}
+  #hint{position:fixed;left:50%;transform:translateX(-50%);bottom:14px;z-index:60;color:#fff;background:rgba(0,0,0,0.36);padding:8px 12px;border-radius:8px;font-size:13px}
+  /* mobile UI */
+  #controls-ui{position:fixed;left:0;right:0;bottom:0;display:flex;justify-content:space-between;padding:14px;z-index:55;pointer-events:none}
+  #joy-left{width:140px;height:140px;margin-left:12px;pointer-events:auto;touch-action:none;position:relative}
+  .joy-bg{width:100%;height:100%;background:rgba(255,255,255,0.04);border-radius:50%;border:1px solid rgba(255,255,255,0.08)}
+  .joy-knob{width:48px;height:48px;background:rgba(255,255,255,0.14);border-radius:50%;position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);pointer-events:none;display:flex;align-items:center;justify-content:center;color:#fff;font-size:14px}
+  #right-controls{margin-right:12px;display:flex;flex-direction:column;gap:10px;pointer-events:none;align-items:flex-end}
+  #look-area{width:220px;height:140px;background:rgba(255,255,255,0.03);border-radius:12px;touch-action:none;pointer-events:auto;border:1px solid rgba(255,255,255,0.06)}
+  .action-row{display:flex;gap:10px;margin-top:6px;pointer-events:auto}
+  .btn{width:56px;height:56px;background:rgba(255,255,255,0.06);border-radius:12px;border:1px solid rgba(255,255,255,0.12);color:#fff;font-size:20px;display:flex;align-items:center;justify-content:center;user-select:none;touch-action:manipulation}
+  #hotbar{position:fixed;left:50%;transform:translateX(-50%);bottom:86px;z-index:57;display:flex;gap:8px;pointer-events:none}
+  .hotbar-slot{pointer-events:auto;width:56px;height:56px;background:rgba(0,0,0,0.45);border-radius:8px;border:2px solid rgba(255,255,255,0.08);display:flex;flex-direction:column;align-items:center;justify-content:center;color:#fff;font-size:12px}
+  .hotbar-slot.selected{border-color:#ffd36b;box-shadow:0 0 8px rgba(255,211,107,0.25)}
+  @media (pointer:fine){#controls-ui{display:none}}
+  canvas{display:block}
+</style>
+</head>
+<body>
+  <div id="game"></div>
+  <div id="hud">Loading noa...</div>
+  <div id="hint">If noa fails to load from CDNs the HUD will show instructions to build locally (npm). This page attempts multiple CDNs automatically.</div>
+
+  <!-- Mobile controls -->
+  <div id="controls-ui" aria-hidden="true">
+    <div id="joy-left" aria-hidden="true"><div class="joy-bg"></div><div class="joy-knob" id="joy-knob">•</div></div>
+    <div id="right-controls" aria-hidden="true">
+      <div id="look-area" title="Drag here to look (mobile)"></div>
+      <div class="action-row">
+        <div class="btn" id="btn-break">⛏</div>
+        <div class="btn" id="btn-jump">⤴</div>
+        <div class="btn" id="btn-place">🧱</div>
+      </div>
+    </div>
+  </div>
+
+  <div id="hotbar"></div>
+
+<script>
+/*
+  Resilient loader for noa-engine single-file demo.
+
+  This script:
+  - attempts to load noa from several CDN URLs (jsDelivr, unpkg, skypack)
+  - once noa is available it initializes the demo (same single-file game)
+  - if all CDN attempts fail it shows clear instructions in HUD for an npm local build
+*/
+
+const HUD = document.getElementById('hud');
+
+const CDN_URLS = [
+  // try pinned/newer versions first (if unavailable adjust version)
+  'https://cdn.jsdelivr.net/npm/noa-engine@2.6.1/dist/noa.min.js',
+  'https://unpkg.com/noa-engine@2.6.1/dist/noa.min.js',
+  'https://cdn.jsdelivr.net/npm/noa-engine/dist/noa.min.js',
+  'https://unpkg.com/noa-engine/dist/noa.min.js',
+  // fallback to skypack ESM build (note: different shape, might not expose window.noa)
+  'https://cdn.skypack.dev/noa-engine@2.6.1/dist/noa.min.js'
+];
+
+function loadScript(url, timeout = 10000) {
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = url;
+    s.async = true;
+    let done = false;
+    const onLoad = () => { if (done) return; done = true; resolve(url); cleanup(); };
+    const onError = () => { if (done) return; done = true; reject(new Error('Failed to load ' + url)); cleanup(); };
+    const cleanup = () => {
+      s.removeEventListener('load', onLoad);
+      s.removeEventListener('error', onError);
+      clearTimeout(timer);
+    };
+    s.addEventListener('load', onLoad);
+    s.addEventListener('error', onError);
+    const timer = setTimeout(()=>{ if(done) return; done = true; reject(new Error('Timeout loading ' + url)); cleanup(); }, timeout);
+    document.head.appendChild(s);
+  });
+}
+
+async function tryLoadNoa() {
+  HUD.innerText = 'Attempting to load noa from CDNs...';
+  for (const url of CDN_URLS) {
+    try {
+      await loadScript(url, 12000);
+      // some CDNs may provide an ESM default export instead of window.noa; check both
+      if (window.noa || window.noa !== undefined) {
+        HUD.innerText = 'Loaded noa from: ' + url;
+        console.log('Loaded noa from', url);
+        return true;
+      } else {
+        // wait a tick for globals to populate (rare)
+        await new Promise(r => setTimeout(r, 50));
+        if (window.noa) {
+          HUD.innerText = 'Loaded noa from: ' + url;
+          console.log('Loaded noa from', url);
+          return true;
+        }
+      }
+    } catch (err) {
+      console.warn('CDN load failed:', url, err);
+    }
+  }
+  return false;
+}
+
+function showNpmInstructions() {
+  HUD.innerHTML = 'Failed to load noa from CDNs.<br>' +
+    'Recommended: build a local bundle with npm and include it in this repo.<br><br>' +
+    'Quick instructions (run locally):<br>' +
+    '<code>git clone &lt;repo&gt;</code><br>' +
+    '<code>npm init -y</code><br>' +
+    '<code>npm install --save noa-engine three</code><br>' +
+    '<code>npx rollup -c</code> (or use webpack) to produce a single bundle and reference it from this HTML)<br><br>' +
+    'If you want, I can generate a small npm project (package.json + build script) you can commit to your repository so GitHub Pages serves a working single-file bundle.';
+}
+
+// After noa is loaded we run the demo initialization using the same logic as previous working demo.
+// To keep this single-file, the initDemo function contains the game setup and UI and uses window.noa.
+function initDemo() {
+  if (!window.noa) {
+    HUD.innerText = 'noa loaded but window.noa is not present. This page expects the UMD build of noa (window.noa).';
+    console.error('noa loaded but not on window');
+    return;
+  }
+
+  // Keep HUD messages for user
+  HUD.innerText = 'Initializing game...';
+
+  // --- Game config (kept modest so it runs well on mobile) ---
+  const WORLD_W = 64, WORLD_H = 40, WORLD_D = 64;
+  const AIR = 0, DIRT = 1, STONE = 2, GRASS = 3, WOOD = 4, LEAVES = 5, SAND = 6;
+  const BLOCKS = {
+    1:{name:'Dirt', color:0x6c5b38},
+    2:{name:'Stone', color:0x8b8b8b},
+    3:{name:'Grass', color:0x3ea033},
+    4:{name:'Wood', color:0x8b5a2b},
+    5:{name:'Leaves', color:0x4ca04c},
+    6:{name:'Sand', color:0xe4d99b}
+  };
+  const inventory = {1:30,2:12,3:20,4:8,5:0,6:14};
+  let selectedBlockId = 3;
+  const joystick = { active:false, id:null, startX:0, startY:0, dx:0, dy:0 };
+  const MAX_JOY = 48, JOY_DEADZONE = 0.18;
+  const hotbarEl = document.getElementById('hotbar');
+  const joyLeft = document.getElementById('joy-left');
+  const joyKnob = document.getElementById('joy-knob');
+  const lookArea = document.getElementById('look-area');
+  const btnPlace = document.getElementById('btn-place');
+  const btnBreak = document.getElementById('btn-break');
+  const btnJump = document.getElementById('btn-jump');
+
+  function rebuildHotbarUI(){
+    hotbarEl.innerHTML = '';
+    const keys = Object.keys(BLOCKS).map(x=>parseInt(x));
+    for(let i=0;i<keys.length;i++){
+      const id = keys[i];
+      const slot = document.createElement('div');
+      slot.className = 'hotbar-slot' + (id === selectedBlockId ? ' selected' : '');
+      slot.dataset.bid = id;
+      slot.innerHTML = `<div style="width:26px;height:26px;border-radius:4px;background:#000;margin-bottom:6px;"></div>
+                        <div style="font-size:11px">${BLOCKS[id].name}</div>
+                        <div style="font-size:12px;margin-top:4px">${inventory[id] ?? 0}</div>`;
+      slot.addEventListener('click', ()=>{ selectedBlockId = id; rebuildHotbarUI(); });
+      slot.addEventListener('touchstart', (e)=>{ e.preventDefault(); selectedBlockId = id; rebuildHotbarUI(); }, {passive:false});
+      hotbarEl.appendChild(slot);
+    }
+  }
+
+  // --- create noa instance ---
+  const opts = {
+    container: document.getElementById('game'),
+    showFPS: false,
+    chunkSize: 16,
+    chunkAddDistance: 2,
+    chunkRemoveDistance: 3,
+    playerStart: [Math.floor(WORLD_W/2), WORLD_H-6, Math.floor(WORLD_D/2)],
+    texturePath: ''
+  };
+
+  // window.noa is the UMD factory (noa function)
+  const noa = window.noa(opts);
+
+  // helper wrappers for world set/get
+  function setBlock(x,y,z,id){ noa.world.setBlockID(x,y,z,id); }
+  function getBlock(x,y,z){ return noa.world.getBlockID(x,y,z); }
+
+  // generate terrain (same approach as earlier demos)
+  const w = WORLD_W, h = WORLD_H, d = WORLD_D;
+  for(let x=0;x<w;x++){
+    for(let z=0;z<d;z++){
+      const ridge = Math.sin(x*0.14) * Math.cos(z*0.09);
+      let height = Math.floor(5 + 6 * (0.5 + 0.5*ridge) + 3*Math.sin((x+z)*0.06) + Math.floor(2*Math.random()));
+      const distEdge = Math.min(x, z, w-1-x, d-1-z);
+      if(distEdge < 4) height = Math.max(1, 2 + Math.floor(Math.random()*2));
+      height = Math.min(height, h-4);
+      for(let y=0;y<height;y++){
+        if(distEdge < 4) setBlock(x,y,z,SAND);
+        else if(y < height-2) setBlock(x,y,z,STONE);
+        else if(y < height-1) setBlock(x,y,z,DIRT);
+        else setBlock(x,y,z,GRASS);
+      }
+      if(height > 3 && Math.random() < 0.03 && distEdge >= 6){
+        const trunkH = 3 + Math.floor(Math.random()*2);
+        for(let ty=height; ty<height+trunkH && ty < h-2; ty++) setBlock(x,ty,z,WOOD);
+        const ly = Math.min(height+trunkH, h-2);
+        for(let ix=-2; ix<=2; ix++){
+          for(let iz=-2; iz<=2; iz++){
+            for(let iy=0; iy<=1; iy++){
+              const lx = x+ix, lz = z+iz, lypos = ly + iy;
+              if(lx>=0 && lx<w && lz>=0 && lz<d && lypos>=0 && lypos<h){
+                if(Math.abs(ix)+Math.abs(iz) <= 4){
+                  if(getBlock(lx, lypos, lz) === AIR) setBlock(lx, lypos, lz, LEAVES);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Build per-chunk instanced visualization (similar to earlier approach)
+  const THREE = noa.rendering.getScene().constructor ? window.THREE || noa.rendering.getScene().constructor : window.THREE;
+  // Use global THREE if available (noa includes three). Fallback: grab noa.rendering.getScene().children to create meshes directly.
+  const cubeGeom = new THREE.BoxGeometry(1,1,1);
+  const matCache = {};
+  function getMaterialFor(id){
+    if(matCache[id]) return matCache[id];
+    const color = BLOCKS[id] ? BLOCKS[id].color : 0xffffff;
+    const m = new THREE.MeshLambertMaterial({ color: color });
+    matCache[id] = m;
+    return m;
+  }
+
+  const chunkMeshes = new Map();
+  function chunkKey(cx,cy,cz){ return cx+','+cy+','+cz; }
+
+  function buildChunkMesh(cx, cy, cz){
+    const size = noa.world._chunkSize || 16;
+    const xs = cx*size, ys = cy*size, zs = cz*size;
+    const entries = [];
+    for(let x=0;x<size;x++){
+      for(let y=0;y<size;y++){
+        for(let z=0;z<size;z++){
+          const wx = xs + x, wy = ys + y, wz = zs + z;
+          const bid = getBlock(wx, wy, wz);
+          if(bid && bid !== AIR) entries.push({x:wx,y:wy,z:wz,bid});
+        }
+      }
+    }
+    if(entries.length === 0) return null;
+    const group = new THREE.Group();
+    const tmpMat4 = new THREE.Matrix4();
+    const byType = entries.reduce((acc,e)=>{ (acc[e.bid]=acc[e.bid]||[]).push(e); return acc; }, {});
+    Object.keys(byType).forEach(bidStr=>{
+      const bid = parseInt(bidStr);
+      const list = byType[bid];
+      const inst = new THREE.InstancedMesh(cubeGeom, getMaterialFor(bid), list.length);
+      inst.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+      for(let i=0;i<list.length;i++){
+        const e = list[i];
+        tmpMat4.makeTranslation(e.x+0.5, e.y+0.5, e.z+0.5);
+        inst.setMatrixAt(i, tmpMat4);
+      }
+      inst.count = list.length;
+      group.add(inst);
+    });
+    return { group, count: entries.length };
+  }
+
+  // Create initial visuals for the region we've populated
+  (function createInitialVisuals(){
+    const chunkSize = noa.world._chunkSize || 16;
+    const cx1 = Math.ceil(WORLD_W / chunkSize), cz1 = Math.ceil(WORLD_D / chunkSize), cy1 = Math.ceil(WORLD_H / chunkSize);
+    for(let cx=0; cx<cx1; cx++){
+      for(let cy=0; cy<cy1; cy++){
+        for(let cz=0; cz<cz1; cz++){
+          const key = chunkKey(cx,cy,cz);
+          const info = buildChunkMesh(cx,cy,cz);
+          if(info){ chunkMeshes.set(key, info); noa.rendering.addMeshToScene(info.group); }
+        }
+      }
+    }
+  })();
+
+  // player entity is handled by noa; camera is attached automatically
+  noa.ents.add('player', { width:0.6, height:1.8, position: opts.playerStart });
+
+  // pointer-lock encouragement
+  document.addEventListener('click', ()=> {
+    if(window.matchMedia && window.matchMedia('(pointer: fine)').matches){
+      const el = document.body;
+      if(el.requestPointerLock) el.requestPointerLock();
+    }
+  });
+
+  // input state
+  const currentInput = { fw:0,bk:0,lt:0,rt:0,jump:false,place:false,break:false,run:false };
+  window.addEventListener('keydown', e=>{
+    if(e.code==='KeyW') currentInput.fw = 1;
+    if(e.code==='KeyS') currentInput.bk = 1;
+    if(e.code==='KeyA') currentInput.lt = 1;
+    if(e.code==='KeyD') currentInput.rt = 1;
+    if(e.code==='Space') currentInput.jump = true;
+    if(e.code==='ShiftLeft' || e.code==='ShiftRight') currentInput.run = true;
+    if(e.code==='KeyE') currentInput.place = true;
+    if(e.code==='KeyQ') currentInput.break = true;
+    if(e.key >= '1' && e.key <= '9'){
+      const n = parseInt(e.key);
+      const keys = Object.keys(BLOCKS).map(x=>parseInt(x));
+      if(n-1 < keys.length){ selectedBlockId = keys[n-1]; rebuildHotbarUI(); }
+    }
+  });
+  window.addEventListener('keyup', e=>{
+    if(e.code==='KeyW') currentInput.fw = 0;
+    if(e.code==='KeyS') currentInput.bk = 0;
+    if(e.code==='KeyA') currentInput.lt = 0;
+    if(e.code==='KeyD') currentInput.rt = 0;
+    if(e.code==='Space') currentInput.jump = false;
+    if(e.code==='ShiftLeft' || e.code==='ShiftRight') currentInput.run = false;
+    if(e.code==='KeyE') currentInput.place = false;
+    if(e.code==='KeyQ') currentInput.break = false;
+  });
+
+  // mobile UI wiring (joystick + look + buttons)
+  function updateKnob(){ if(!joyKnob||!joyLeft) return; const w = joyLeft.clientWidth, h = joyLeft.clientHeight; joyKnob.style.left = (50 + joystick.dx / w * 100) + '%'; joyKnob.style.top = (50 + joystick.dy / h * 100) + '%'; }
+  if(joyLeft){
+    joyLeft.addEventListener('touchstart', e=>{ e.preventDefault(); const t = e.changedTouches[0]; joystick.active = true; joystick.id = t.identifier; const rect = joyLeft.getBoundingClientRect(); joystick.startX = rect.left + rect.width/2; joystick.startY = rect.top + rect.height/2; joystick.dx = joystick.dy = 0; updateKnob(); }, {passive:false});
+    joyLeft.addEventListener('touchmove', e=>{ if(!joystick.active) return; for(const t of Array.from(e.changedTouches)){ if(t.identifier === joystick.id){ joystick.dx = t.clientX - joystick.startX; joystick.dy = t.clientY - joystick.startY; const dist = Math.hypot(joystick.dx, joystick.dy); if(dist > MAX_JOY){ const s = MAX_JOY / dist; joystick.dx *= s; joystick.dy *= s; } updateKnob(); e.preventDefault(); return; } } }, {passive:false});
+    joyLeft.addEventListener('touchend', e=>{ for(const t of Array.from(e.changedTouches)){ if(t.identifier === joystick.id){ joystick.active = false; joystick.id = null; joystick.dx = joystick.dy = 0; updateKnob(); e.preventDefault(); return; } } }, {passive:false});
+  }
+
+  let lookTouchId = null, lastLookX = 0, lastLookY = 0;
+  if(lookArea){
+    lookArea.addEventListener('touchstart', e=>{ const t = e.changedTouches[0]; lookTouchId = t.identifier; lastLookX = t.clientX; lastLookY = t.clientY; }, {passive:true});
+    lookArea.addEventListener('touchmove', e=>{ if(lookTouchId === null) return; for(const t of Array.from(e.changedTouches)){ if(t.identifier === lookTouchId){ const dx = t.clientX - lastLookX, dy = t.clientY - lastLookY; noa.camera.rotateYaw(-dx * 0.0035); noa.camera.rotatePitch(-dy * 0.0035); lastLookX = t.clientX; lastLookY = t.clientY; e.preventDefault(); return; } } }, {passive:false});
+    lookArea.addEventListener('touchend', e=>{ for(const t of Array.from(e.changedTouches)){ if(t.identifier === lookTouchId){ lookTouchId = null; e.preventDefault(); return; } } }, {passive:false});
+  }
+
+  if(btnPlace){ btnPlace.addEventListener('touchstart', e=>{ e.preventDefault(); currentInput.place = true; }, {passive:false}); btnPlace.addEventListener('touchend', e=>{ currentInput.place = false; }, {passive:true}); }
+  if(btnBreak){ btnBreak.addEventListener('touchstart', e=>{ e.preventDefault(); currentInput.break = true; }, {passive:false}); btnBreak.addEventListener('touchend', e=>{ currentInput.break = false; }, {passive:true}); }
+  if(btnJump){ btnJump.addEventListener('touchstart', e=>{ e.preventDefault(); currentInput.jump = true; }, {passive:false}); btnJump.addEventListener('touchend', e=>{ currentInput.jump = false; }, {passive:true}); }
+
+  // raycast helper (sample-along-ray)
+  function getBlockTarget(){
+    const origin = noa.camera.getPosition();
+    const dir = noa.camera.getDirection();
+    const maxDist = 8;
+    const step = 0.15;
+    const pos = [ origin[0], origin[1], origin[2] ];
+    for(let t=0;t<maxDist;t+=step){
+      pos[0] += dir[0]*step;
+      pos[1] += dir[1]*step;
+      pos[2] += dir[2]*step;
+      const bx = Math.floor(pos[0]), by = Math.floor(pos[1]), bz = Math.floor(pos[2]);
+      if(bx < 0 || by < 0 || bz < 0 || bx >= w || by >= h || bz >= d) continue;
+      const bid = getBlock(bx,by,bz);
+      if(bid && bid !== AIR){
+        const prevX = Math.floor(pos[0] - dir[0]*step), prevY = Math.floor(pos[1] - dir[1]*step), prevZ = Math.floor(pos[2] - dir[2]*step);
+        return { block:{x:bx,y:by,z:bz}, target:{x:prevX,y:prevY,z:prevZ} };
+      }
+    }
+    return null;
+  }
+
+  function isBlockOverlappingPlayer(tx,ty,tz){
+    const px = noa.camera.getPosition()[0], py = noa.camera.getPosition()[1], pz = noa.camera.getPosition()[2];
+    const halfWidth = 0.35;
+    const playerMin = { x: px - halfWidth, y: py - 1.6, z: pz - halfWidth };
+    const playerMax = { x: px + halfWidth, y: py, z: pz + halfWidth };
+    const blockMin = { x: tx, y: ty, z: tz };
+    const blockMax = { x: tx + 1, y: ty + 1, z: tz + 1 };
+    return (playerMin.x < blockMax.x && playerMax.x > blockMin.x) &&
+           (playerMin.y < blockMax.y && playerMax.y > blockMin.y) &&
+           (playerMin.z < blockMax.z && playerMax.z > blockMin.z);
+  }
+
+  // place/break cooldowns
+  let placeCooldown = 0, breakCooldown = 0, lastTimeTick = performance.now();
+  const COOLDOWN = 200;
+
+  noa.on('tick', function(dt){
+    const now = performance.now();
+    const deltaMs = now - lastTimeTick;
+    lastTimeTick = now;
+    placeCooldown = Math.max(0, placeCooldown - deltaMs);
+    breakCooldown = Math.max(0, breakCooldown - deltaMs);
+
+    // map joystick/keyboard to noa.inputs.state
+    let joyX = 0, joyY = 0;
+    if(joystick.active){ joyX = joystick.dx / MAX_JOY; joyY = -joystick.dy / MAX_JOY; if(Math.abs(joyX) < JOY_DEADZONE) joyX = 0; if(Math.abs(joyY) < JOY_DEADZONE) joyY = 0; }
+    const forward = joyY !== 0 ? joyY : (currentInput.fw ? 1 : (currentInput.bk ? -1 : 0));
+    const side = joyX !== 0 ? joyX : (currentInput.rt ? 1 : (currentInput.lt ? -1 : 0));
+    noa.inputs.state.forward = forward;
+    noa.inputs.state.side = side;
+    noa.inputs.state.jump = currentInput.jump;
+
+    // breaking
+    if(currentInput.break && breakCooldown <= 0){
+      const tgt = getBlockTarget();
+      if(tgt){
+        const bx = tgt.block.x, by = tgt.block.y, bz = tgt.block.z;
+        const bid = getBlock(bx,by,bz);
+        if(bid && bid !== AIR){
+          setBlock(bx,by,bz, AIR);
+          // rebuild chunk mesh
+          const cx = Math.floor(bx / (noa.world._chunkSize || 16));
+          const cy = Math.floor(by / (noa.world._chunkSize || 16));
+          const cz = Math.floor(bz / (noa.world._chunkSize || 16));
+          const key = chunkKey(cx,cy,cz);
+          const info = chunkMeshes.get(key);
+          if(info){ noa.rendering.removeMeshFromScene(info.group); chunkMeshes.delete(key); const rebuilt = buildChunkMesh(cx,cy,cz); if(rebuilt){ chunkMeshes.set(key,rebuilt); noa.rendering.addMeshToScene(rebuilt.group); } }
+          inventory[bid] = (inventory[bid] || 0) + 1;
+          rebuildHotbarUI();
+          breakCooldown = COOLDOWN;
+        }
+      }
+      currentInput.break = false;
+    }
+
+    // placing
+    if(currentInput.place && placeCooldown <= 0){
+      const tgt = getBlockTarget();
+      if(tgt){
+        const tx = tgt.target.x, ty = tgt.target.y, tz = tgt.target.z;
+        if(tx>=0 && ty>=0 && tz>=0 && tx<w && ty<h && tz<d && getBlock(tx,ty,tz) === AIR){
+          if(!isBlockOverlappingPlayer(tx,ty,tz) && (inventory[selectedBlockId] || 0) > 0){
+            setBlock(tx,ty,tz, selectedBlockId);
+            // rebuild chunk mesh
+            const cx = Math.floor(tx / (noa.world._chunkSize || 16));
+            const cy = Math.floor(ty / (noa.world._chunkSize || 16));
+            const cz = Math.floor(tz / (noa.world._chunkSize || 16));
+            const key = chunkKey(cx,cy,cz);
+            const info = chunkMeshes.get(key);
+            if(info){ noa.rendering.removeMeshFromScene(info.group); chunkMeshes.delete(key); }
+            const rebuilt = buildChunkMesh(cx,cy,cz);
+            if(rebuilt){ chunkMeshes.set(key, rebuilt); noa.rendering.addMeshToScene(rebuilt.group); }
+            inventory[selectedBlockId] = (inventory[selectedBlockId] || 0) - 1;
+            rebuildHotbarUI();
+            placeCooldown = COOLDOWN;
+          }
+        }
+      }
+      currentInput.place = false;
+    }
+
+    // update HUD
+    const camPos = noa.camera.getPosition();
+    HUD.innerHTML = `Pos: ${camPos[0].toFixed(2)}, ${camPos[1].toFixed(2)}, ${camPos[2].toFixed(2)}<br>
+                     Selected: ${BLOCKS[selectedBlockId].name} (${inventory[selectedBlockId]||0})<br>
+                     Blocks visible: ${[...chunkMeshes.values()].reduce((s,i)=>s+i.count,0)}`;
+  });
+
+  rebuildHotbarUI();
+  HUD.innerText = 'Loaded: noa demo ready. Use controls (WASD/joystick) to move, Q break, E place.';
+  // keep knob updated promptly
+  (function keepKnob(){ updateKnob(); requestAnimationFrame(keepKnob); })();
+} // end initDemo
+
+// Try loading noa then init or show npm instructions
+(async function () {
+  const ok = await tryLoadNoa();
+  if (ok) {
+    // small delay to ensure noa has finished init in some CDNs
+    setTimeout(initDemo, 60);
+  } else {
+    showNpmInstructions();
+    console.error('All CDN attempts to load noa failed. See HUD for npm build instructions.');
+  }
+})();
+</script>
+</body>
+</html>
